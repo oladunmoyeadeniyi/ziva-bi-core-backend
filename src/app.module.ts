@@ -10,19 +10,9 @@
  */
 
 import { Module } from '@nestjs/common';
-import { HealthController } from './controllers/health.controller';
-
-@Module({
-  imports: [],
-  controllers: [HealthController],
-  providers: [],
-})
-
-export class AppModule {}
-
-// src/app.module.ts (snippet)
-import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
+
+// Controllers
 import { HealthController } from './controllers/health.controller';
 
 // Entities
@@ -40,13 +30,24 @@ import { UserTenant } from './modules/auth/entities/user-tenants.entity';
       username: process.env.DB_USER || 'postgres',
       password: process.env.DB_PASSWORD || 'postgres',
       database: process.env.DB_NAME || 'zivabi',
-      entities: [Tenant, TenantSettings, User, UserTenant /* add others as they come */],
-      synchronize: false, // set to false for production; use migrations
-      logging: false,
+      entities: [
+        Tenant,
+        TenantSettings,
+        User,
+        UserTenant,
+      ],
+      synchronize: false,
       ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : false,
     }),
-    TypeOrmModule.forFeature([Tenant, TenantSettings, User, UserTenant]),
+
+    TypeOrmModule.forFeature([
+      Tenant,
+      TenantSettings,
+      User,
+      UserTenant,
+    ]),
   ],
+
   controllers: [HealthController],
   providers: [],
 })
