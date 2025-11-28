@@ -11,44 +11,24 @@
 
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
-
-// Controllers
-import { HealthController } from './controllers/health.controller';
-
-// Entities
-import { Tenant } from './modules/auth/entities/tenant.entity';
-import { TenantSettings } from './modules/auth/entities/tenant-settings.entity';
-import { User } from './modules/auth/entities/users.entity';
-import { UserTenant } from './modules/auth/entities/user-tenants.entity';
+import { ConfigModule } from '@nestjs/config';
+import { AuthModule } from './modules/auth/auth.module';
+import { RbacModule } from './modules/rbac/rbac.module';
+import { HealthController } from './health.controller';
 
 @Module({
   imports: [
+    ConfigModule.forRoot({ isGlobal: true }),
     TypeOrmModule.forRoot({
       type: 'postgres',
-      host: process.env.DB_HOST || 'localhost',
-      port: Number(process.env.DB_PORT || 5432),
-      username: process.env.DB_USER || 'postgres',
-      password: process.env.DB_PASSWORD || 'postgres',
-      database: process.env.DB_NAME || 'zivabi',
-      entities: [
-        Tenant,
-        TenantSettings,
-        User,
-        UserTenant,
-      ],
-      synchronize: false,
-      ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : false,
+      url: process.env.DATABASE_URL,
+      autoLoadEntities: true,
+      synchronize: true, // Change to false in production
+      ssl: { rejectUnauthorized: false },
     }),
-
-    TypeOrmModule.forFeature([
-      Tenant,
-      TenantSettings,
-      User,
-      UserTenant,
-    ]),
+    AuthModule,
+    RbacModule,
   ],
-
   controllers: [HealthController],
-  providers: [],
 })
 export class AppModule {}
