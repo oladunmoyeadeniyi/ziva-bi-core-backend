@@ -8,21 +8,19 @@ import { Permission } from './entities/permission.entity';
 import { RolePermission } from './entities/role-permission.entity';
 import { UserRole } from './entities/user-role.entity';
 
+import { AuditService } from '../audit/audit.service';
+
 /**
- * RBAC SERVICE
+ * RBAC SERVICE - integrated with AuditService
  *
- * Responsibilities:
+ * Responsibilities: (unchanged)
  * - CRUD helpers for Role and Permission entities
  * - Assign/Unassign Role <-> Permission and User <-> Role
  * - Resolve effective permissions for a user (tenant-aware)
  * - Helper boolean checks: userHasPermission, userHasRole
  *
- * Notes:
- * - This service expects `userTenantId` to represent the user in the scope of a tenant.
- *   That is typically the primary key for user_tenants (the row that connects a user to a tenant).
- * - For multi-tenant isolation: if tenantId is supplied to permission resolution, the
- *   service will (optionally) filter roles/permissions by tenant scope if/when we extend schema.
- *   Current entities are global; if you want tenant-scoped roles/permissions, we'll add tenant_id columns.
+ * Audit integration:
+ *  - All state-changing operations write an audit record via AuditService.log(...)
  */
 @Injectable()
 export class RbacService {
@@ -31,6 +29,7 @@ export class RbacService {
     @InjectRepository(Permission) private readonly permRepo: Repository<Permission>,
     @InjectRepository(RolePermission) private readonly rolePermRepo: Repository<RolePermission>,
     @InjectRepository(UserRole) private readonly userRoleRepo: Repository<UserRole>,
+    private readonly auditService: AuditService,
   ) {}
 
   // ---------------------------
@@ -39,31 +38,56 @@ export class RbacService {
 
   /**
    * Create or return an existing role by name.
+   * Optional actorId & tenantId are used to write an audit event.
+   *
    * @param name Example: "finance_manager"
    * @param description Optional description
+   * @param opts optional { actorId, tenantId }
    */
-  async createRole(name: string, description?: string): Promise<Role> {
+  async createRole(name: string, description?: string, opts?: { actorId?: string; tenantId?: string }): Promise<Role> {
     if (!name || name.trim() === '') {
       throw new BadRequestException('Role name is required');
     }
     const existing = await this.roleRepo.findOne({ where: { name } });
     if (existing) return existing;
     const role = this.roleRepo.create({ name, description });
-    return this.roleRepo.save(role);
+    const saved = await this.roleRepo.save(role);
+
+    // Audit
+    await this.auditService.log('rbac.role.create', {
+      tenantId: opts?.tenantId ?? null,
+      actorId: opts?.actorId ?? null,
+      resourceType: 'Role',
+      resourceId: saved.id,
+      details: { name: saved.name, description: saved.description },
+    });
+
+    return saved;
   }
 
   /**
    * Create or return an existing permission by key.
-   * @param key Example: "expenses.create"
+   * Optional actorId & tenantId used for audit.
    */
-  async createPermission(key: string, description?: string): Promise<Permission> {
+  async createPermission(key: string, description?: string, opts?: { actorId?: string; tenantId?: string }): Promise<Permission> {
     if (!key || key.trim() === '') {
       throw new BadRequestException('Permission key is required');
     }
     const existing = await this.permRepo.findOne({ where: { key } });
     if (existing) return existing;
     const perm = this.permRepo.create({ key, description });
-    return this.permRepo.save(perm);
+    const saved = await this.permRepo.save(perm);
+
+    // Audit
+    await this.auditService.log('rbac.permission.create', {
+      tenantId: opts?.tenantId ?? null,
+      actorId: opts?.actorId ?? null,
+      resourceType: 'Permission',
+      resourceId: saved.id,
+      details: { key: saved.key, description: saved.description },
+    });
+
+    return saved;
   }
 
   /**
@@ -97,8 +121,13 @@ export class RbacService {
   /**
    * Assign a permission to a role.
    * If mapping exists, returns the existing mapping.
+   * Logs audit event.
+   *
+   * @param roleId
+   * @param permissionId
+   * @param opts optional { actorId, tenantId }
    */
-  async assignPermissionToRole(roleId: string, permissionId: string): Promise<RolePermission> {
+  async assignPermissionToRole(roleId: string, permissionId: string, opts?: { actorId?: string; tenantId?: string }): Promise<RolePermission> {
     if (!roleId || !permissionId) {
       throw new BadRequestException('roleId and permissionId are required');
     }
@@ -121,13 +150,24 @@ export class RbacService {
       role_id: roleId,
       permission_id: permissionId,
     });
-    return this.rolePermRepo.save(rp);
+    const saved = await this.rolePermRepo.save(rp);
+
+    // Audit
+    await this.auditService.log('rbac.role.permission.assign', {
+      tenantId: opts?.tenantId ?? null,
+      actorId: opts?.actorId ?? null,
+      resourceType: 'RolePermission',
+      resourceId: saved.id,
+      details: { roleId, permissionId, roleName: role.name, permissionKey: permission.key },
+    });
+
+    return saved;
   }
 
   /**
    * Bulk assign permissions to a role (useful for templates)
    */
-  async assignPermissionsToRole(roleId: string, permissionIds: string[]): Promise<RolePermission[]> {
+  async assignPermissionsToRole(roleId: string, permissionIds: string[], opts?: { actorId?: string; tenantId?: string }): Promise<RolePermission[]> {
     if (!roleId || !Array.isArray(permissionIds) || permissionIds.length === 0) {
       throw new BadRequestException('roleId and permissionIds are required');
     }
@@ -151,6 +191,15 @@ export class RbacService {
       if (!permExists) continue;
       const rp = this.rolePermRepo.create({ role_id: roleId, permission_id: permId });
       created.push(await this.rolePermRepo.save(rp));
+
+      // Audit each assignment
+      await this.auditService.log('rbac.role.permission.assign', {
+        tenantId: opts?.tenantId ?? null,
+        actorId: opts?.actorId ?? null,
+        resourceType: 'RolePermission',
+        resourceId: rp.id,
+        details: { roleId, permissionId: permId, roleName: role.name, permissionKey: permExists.key },
+      });
     }
 
     return created.concat(existingRps);
@@ -164,8 +213,12 @@ export class RbacService {
    * Assign role to a user (userTenantId).
    * userTenantId represents the user within a tenant context.
    * assignedBy is optional (who performed the assignment).
+   *
+   * @param userTenantId
+   * @param roleId
+   * @param opts optional { actorId, tenantId, assignedBy }
    */
-  async assignRoleToUser(userTenantId: string, roleId: string, assignedBy?: string): Promise<UserRole> {
+  async assignRoleToUser(userTenantId: string, roleId: string, opts?: { actorId?: string; tenantId?: string; assignedBy?: string }): Promise<UserRole> {
     if (!userTenantId || !roleId) {
       throw new BadRequestException('userTenantId and roleId are required');
     }
@@ -183,18 +236,42 @@ export class RbacService {
     const ur = this.userRoleRepo.create({
       user_tenant_id: userTenantId,
       role_id: roleId,
-      assigned_by: assignedBy,
+      assigned_by: opts?.assignedBy ?? opts?.actorId ?? null,
       assigned_at: new Date(),
     });
-    return this.userRoleRepo.save(ur);
+    const saved = await this.userRoleRepo.save(ur);
+
+    // Audit
+    await this.auditService.log('rbac.user.role.assign', {
+      tenantId: opts?.tenantId ?? null,
+      actorId: opts?.actorId ?? null,
+      resourceType: 'UserRole',
+      resourceId: saved.id,
+      details: { userTenantId, roleId, roleName: role.name, assignedBy: saved.assigned_by },
+    });
+
+    return saved;
   }
 
   /**
    * Remove a role from a user (soft remove possible in future).
+   * Writes an audit record containing what was removed.
    */
-  async removeRoleFromUser(userTenantId: string, roleId: string): Promise<void> {
+  async removeRoleFromUser(userTenantId: string, roleId: string, opts?: { actorId?: string; tenantId?: string }): Promise<void> {
     if (!userTenantId || !roleId) return;
+
+    // find existing record (for audit details)
+    const existing = await this.userRoleRepo.findOne({ where: { user_tenant_id: userTenantId, role_id: roleId } });
     await this.userRoleRepo.delete({ user_tenant_id: userTenantId, role_id: roleId });
+
+    // Audit (include removed record id where possible)
+    await this.auditService.log('rbac.user.role.remove', {
+      tenantId: opts?.tenantId ?? null,
+      actorId: opts?.actorId ?? null,
+      resourceType: 'UserRole',
+      resourceId: existing?.id ?? null,
+      details: { userTenantId, roleId, removedRecord: existing ?? null },
+    });
   }
 
   // ----------------------------------------
