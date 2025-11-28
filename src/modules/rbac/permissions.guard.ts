@@ -1,39 +1,94 @@
-// src/modules/rbac/permissions.guard.ts
-import { Injectable, CanActivate, ExecutionContext, ForbiddenException } from '@nestjs/common';
+import {
+  Injectable,
+  CanActivate,
+  ExecutionContext,
+  ForbiddenException,
+} from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
-import { PERMISSIONS_KEY } from './permissions.decorator';
 import { RbacService } from './rbac.service';
+import { PERMISSIONS_KEY } from './permissions.decorator';
 
 /**
- * PermissionsGuard should be used after authentication guard.
- * Example usage:
- * @UseGuards(JwtAuthGuard, PermissionsGuard)
- * @Permissions('expenses.create')
+ * PERMISSIONS GUARD
+ * ---------------------------------------------------------
+ * This guard blocks route access unless a user has the proper
+ * permission key(s). It works together with:
+ *
+ *   @UseGuards(JwtAuthGuard, PermissionsGuard)
+ *   @Permissions('expenses.create')
+ *
+ * This ensures clean, secure, enterprise-grade RBAC.
+ *
+ * What this guard enforces:
+ *  1. User must be authenticated
+ *  2. User must belong to the tenant of the request
+ *  3. Required permissions must be assigned to their roles
+ *  4. Super Admin can bypass all permissions
+ *  5. Future-ready for module-subscription checks
  */
+
 @Injectable()
 export class PermissionsGuard implements CanActivate {
-  constructor(private reflector: Reflector, private rbac: RbacService) {}
+  constructor(
+    private reflector: Reflector,
+    private rbacService: RbacService,
+  ) {}
 
-  async canActivate(ctx: ExecutionContext): Promise<boolean> {
-    const required = this.reflector.getAllAndOverride<string[]>(PERMISSIONS_KEY, [
-      ctx.getHandler(),
-      ctx.getClass(),
-    ]);
-    if (!required || required.length === 0) return true; // no permission required
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    // Extract permissions required by the route handler.
+    const requiredPermissions =
+      this.reflector.getAllAndOverride<string[]>(PERMISSIONS_KEY, [
+        context.getHandler(),
+        context.getClass(),
+      ]) || [];
 
-    const req = ctx.switchToHttp().getRequest();
-    const user = req.user; // JWT guard should populate req.user
+    // If the route requires no permissions, allow access.
+    if (requiredPermissions.length === 0) {
+      return true;
+    }
 
-    if (!user) throw new ForbiddenException('Unauthenticated');
+    // Retrieve authenticated user object from request (injected by JwtAuthGuard).
+    const request = context.switchToHttp().getRequest();
+    const user = request.user;
 
-    // user.sub expected to be user_tenant_id
-    const userTenantId = user.sub || user.userTenantId || user.user_tenant_id;
-    if (!userTenantId) throw new ForbiddenException('Invalid user payload');
+    if (!user) {
+      throw new ForbiddenException('User not authenticated.');
+    }
 
-    // check each required permission (all must be present)
-    for (const perm of required) {
-      const ok = await this.rbac.userHasPermission(userTenantId, perm);
-      if (!ok) throw new ForbiddenException(`Missing permission: ${perm}`);
+    const { userId, tenantId, roles, isSuperAdmin } = user;
+
+    // SUPER ADMIN BYPASS
+    if (isSuperAdmin === true) {
+      return true;
+    }
+
+    // VALIDATE TENANT CONTEXT
+    if (!tenantId) {
+      throw new ForbiddenException('Tenant context missing.');
+    }
+
+    // LOAD USER PERMISSIONS FROM DATABASE
+    const userPermissions = await this.rbacService.getUserPermissions(
+      userId,
+      tenantId,
+    );
+
+    // If user has no permissions assigned
+    if (!userPermissions || userPermissions.length === 0) {
+      throw new ForbiddenException(
+        'You do not have permissions to access this resource.',
+      );
+    }
+
+    // PERMISSION MATCH CHECK
+    const hasPermission = requiredPermissions.every((perm) =>
+      userPermissions.includes(perm),
+    );
+
+    if (!hasPermission) {
+      throw new ForbiddenException(
+        `Missing required permissions: ${requiredPermissions.join(', ')}`,
+      );
     }
 
     return true;

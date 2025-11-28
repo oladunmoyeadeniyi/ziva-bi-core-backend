@@ -1,36 +1,73 @@
-// src/modules/rbac/roles.guard.ts
-import { Injectable, CanActivate, ExecutionContext, ForbiddenException } from '@nestjs/common';
+import {
+  Injectable,
+  CanActivate,
+  ExecutionContext,
+  ForbiddenException,
+} from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
-import { RbacService } from './rbac.service';
-
-export const ROLES_KEY = 'required_roles';
-import { SetMetadata } from '@nestjs/common';
-export const Roles = (...roles: string[]) => SetMetadata(ROLES_KEY, roles);
+import { ROLES_KEY } from './roles.decorator';
 
 /**
- * Use: @UseGuards(JwtAuthGuard, RolesGuard) @Roles('finance_manager')
+ * ROLES GUARD
+ * ---------------------------------------------------------
+ * This guard checks whether the authenticated user has one
+ * of the required roles for a route.
+ *
+ * Usage:
+ *    @UseGuards(JwtAuthGuard, RolesGuard)
+ *    @Roles('finance_manager', 'tenant_admin')
+ *
+ * This guard is OPTIONAL and works best alongside PermissionsGuard.
  */
+
 @Injectable()
 export class RolesGuard implements CanActivate {
-  constructor(private reflector: Reflector, private rbac: RbacService) {}
+  constructor(private reflector: Reflector) {}
 
-  async canActivate(ctx: ExecutionContext): Promise<boolean> {
-    const required = this.reflector.getAllAndOverride<string[]>(ROLES_KEY, [
-      ctx.getHandler(),
-      ctx.getClass(),
-    ]);
-    if (!required || required.length === 0) return true;
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    // ROLES REQUIRED BY THE ROUTE
+    const requiredRoles =
+      this.reflector.getAllAndOverride<string[]>(ROLES_KEY, [
+        context.getHandler(),
+        context.getClass(),
+      ]) || [];
 
-    const req = ctx.switchToHttp().getRequest();
-    const user = req.user;
-    if (!user) throw new ForbiddenException('Unauthenticated');
-    const userTenantId = user.sub || user.userTenantId || user.user_tenant_id;
-    if (!userTenantId) throw new ForbiddenException('Invalid user payload');
-
-    for (const r of required) {
-      const ok = await this.rbac.userHasRole(userTenantId, r);
-      if (!ok) throw new ForbiddenException(`Missing role: ${r}`);
+    // If no roles required → allow
+    if (requiredRoles.length === 0) {
+      return true;
     }
+
+    // Authenticated user object (populated by JwtAuthGuard)
+    const request = context.switchToHttp().getRequest();
+    const user = request.user;
+
+    if (!user) {
+      throw new ForbiddenException('User not authenticated');
+    }
+
+    const { roles, isSuperAdmin } = user;
+
+    // SUPER ADMIN BYPASSES ROLE CHECK
+    if (isSuperAdmin) {
+      return true;
+    }
+
+    // If user has no roles at all
+    if (!roles || roles.length === 0) {
+      throw new ForbiddenException('You have no assigned roles');
+    }
+
+    // Check if user has AT LEAST one required role
+    const hasRole = requiredRoles.some((requiredRole) =>
+      roles.includes(requiredRole),
+    );
+
+    if (!hasRole) {
+      throw new ForbiddenException(
+        `Access denied. Missing required role(s): ${requiredRoles.join(', ')}`,
+      );
+    }
+
     return true;
   }
 }
