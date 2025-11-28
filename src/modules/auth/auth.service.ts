@@ -1,25 +1,23 @@
 /**
  * auth.service.ts
  *
- * Ziva BI — Authentication service (NestJS)
+ * Fully corrected version:
+ * - TypeORM v0.3-compatible queries (In, IsNull, MoreThan)
+ * - Generates access + refresh tokens (refresh token rotation)
+ * - Resolves roles & permissions to include in JWT payload
+ * - OTP send & verify (hashed)
  *
- * Responsibilities:
- *  - Register tenant-scoped users
- *  - Password-based login (creates session + issues access & refresh tokens)
- *  - Refresh token rotation (secure, hashed)
- *  - Logout (revoke session + tokens)
- *  - OTP send & verify
- *  - Resolve roles & permissions for JWT payload
- *
- * Security & production notes (read carefully):
- *  - Refresh tokens are NEVER stored in raw form. We hash them using HMAC and store the hash.
- *  - Passwords are hashed with argon2 via HashUtil.
- *  - MFA, audit logging and provider integrations are scaffolded but should be wired to real providers in prod.
+ * NOTE: Ensure the entities imported below match actual file names/paths in your repo.
  */
 
-import { Injectable, BadRequestException, UnauthorizedException, NotFoundException, InternalServerErrorException } from '@nestjs/common';
+import {
+  Injectable,
+  BadRequestException,
+  UnauthorizedException,
+  NotFoundException,
+} from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, MoreThan } from 'typeorm';
+import { Repository, MoreThan, IsNull, In } from 'typeorm';
 import { JwtService } from '@nestjs/jwt';
 import * as crypto from 'crypto';
 import { addDays } from 'date-fns';
@@ -27,7 +25,7 @@ import { addDays } from 'date-fns';
 import { AUTH } from './constants';
 import { HashUtil } from './utils/hash.util';
 
-// Entities (tenant-scoped location)
+// Entities - ensure these paths match your project structure
 import { User } from './entities/users.entity';
 import { UserTenant } from './entities/user-tenants.entity';
 import { Session } from './entities/sessions.entity';
@@ -54,9 +52,7 @@ export class AuthService {
   ) {}
 
   // ---------------------------
-  // REGISTER
-  //  - Create global user if missing
-  //  - Create tenant membership (user_tenant) with password hash
+  // register
   // ---------------------------
   async register(dto: {
     displayName: string;
@@ -65,10 +61,9 @@ export class AuthService {
     password: string;
     tenantId: string;
   }) {
-    // sanitize minimal checks
     if (!dto.tenantId) throw new BadRequestException('tenantId required');
 
-    // (1) Find or create global user
+    // Find or create global user
     let globalUser = await this.userRepo.findOne({ where: { primary_email: dto.loginEmail } });
     if (!globalUser) {
       globalUser = this.userRepo.create({
@@ -79,13 +74,12 @@ export class AuthService {
       globalUser = await this.userRepo.save(globalUser);
     }
 
-    // (2) Ensure tenant membership does not already exist
+    // Ensure tenant membership does not exist
     const existing = await this.userTenantRepo.findOne({
       where: { tenant_id: dto.tenantId, login_email: dto.loginEmail },
     });
     if (existing) throw new BadRequestException('User already exists for this tenant');
 
-    // (3) Hash password & create userTenant
     const passwordHash = await HashUtil.hashPassword(dto.password);
 
     const userTenant = this.userTenantRepo.create({
@@ -99,17 +93,11 @@ export class AuthService {
     });
 
     const saved = await this.userTenantRepo.save(userTenant);
-
-    // Return minimal info (do NOT auto login)
     return { userTenantId: saved.id, userId: saved.user_id };
   }
 
   // ---------------------------
-  // LOGIN
-  //  - Validate credentials
-  //  - Create session
-  //  - Issue access token + refresh token (raw returned)
-  //  - Include roles & permissions in JWT payload
+  // login
   // ---------------------------
   async login(dto: {
     loginEmail?: string;
@@ -120,7 +108,6 @@ export class AuthService {
   }) {
     if (!dto.tenantId) throw new BadRequestException('tenantId required');
 
-    // find userTenant by email or phone
     const where = dto.loginEmail
       ? { tenant_id: dto.tenantId, login_email: dto.loginEmail }
       : { tenant_id: dto.tenantId, login_phone: dto.loginPhone };
@@ -135,7 +122,7 @@ export class AuthService {
 
     if (!userTenant.is_active) throw new UnauthorizedException('User is disabled');
 
-    // Create session row
+    // create session
     const session = this.sessionRepo.create({
       user_tenant_id: userTenant.id,
       device_fingerprint: dto.deviceFingerprint || null,
@@ -147,10 +134,9 @@ export class AuthService {
     });
     const savedSession = await this.sessionRepo.save(session);
 
-    // Resolve roles & permissions for this userTenant
+    // roles & permissions
     const { roleNames, permissionKeys } = await this.resolveRolesAndPermissions(userTenant.id);
 
-    // Build JWT payload
     const payload = {
       sub: userTenant.id,
       tenant: userTenant.tenant_id,
@@ -163,7 +149,7 @@ export class AuthService {
 
     return {
       accessToken,
-      refreshToken: refreshEntry.raw, // raw token must be stored securely by client
+      refreshToken: refreshEntry.raw,
       refreshTokenExpiresAt: refreshEntry.expiresAt.toISOString(),
       sessionId: savedSession.id,
       userTenantId: userTenant.id,
@@ -184,13 +170,11 @@ export class AuthService {
 
   // ---------------------------
   // generateRefreshTokenEntry
-  //  - create raw token, hash it with HMAC, store the hash in DB
   // ---------------------------
   async generateRefreshTokenEntry(sessionId?: string) {
-    const raw = crypto.randomBytes(64).toString('hex'); // strong random
+    const raw = crypto.randomBytes(64).toString('hex');
     const hashed = HashUtil.hmac(raw, AUTH.REFRESH_HASH_SECRET);
 
-    // Compute expiry: parse REFRESH_EXPIRES_IN (support '30d' or seconds)
     const days = parseDurationDaysToDays(AUTH.REFRESH_EXPIRES_IN || '30d');
     const expiresAt = addDays(new Date(), days);
 
@@ -209,7 +193,6 @@ export class AuthService {
 
   // ---------------------------
   // refresh
-  //  - rotate refresh token securely
   // ---------------------------
   async refresh(refreshTokenRaw: string, sessionId: string) {
     if (!refreshTokenRaw) throw new BadRequestException('refreshToken required');
@@ -223,19 +206,15 @@ export class AuthService {
     if (stored.expires_at < new Date()) throw new UnauthorizedException('Refresh token expired');
     if (stored.session_id !== sessionId) throw new UnauthorizedException('Session mismatch');
 
-    // Ensure session exists and is active
     const session = await this.sessionRepo.findOne({ where: { id: sessionId } });
     if (!session || session.is_revoked) throw new UnauthorizedException('Session invalid');
 
-    // Rotate: create new refresh token entry bound to same session
     const newEntry = await this.generateRefreshTokenEntry(sessionId);
 
-    // Revoke old token & point replaced_by
     stored.revoked_at = new Date();
     stored.replaced_by = newEntry.id;
     await this.refreshRepo.save(stored);
 
-    // Fetch userTenant for building new access token payload
     const userTenant = await this.userTenantRepo.findOne({ where: { id: session.user_tenant_id } });
     if (!userTenant) throw new NotFoundException('User session not found');
 
@@ -248,7 +227,6 @@ export class AuthService {
 
   // ---------------------------
   // logout
-  //  - revoke session and all refresh tokens in that session
   // ---------------------------
   async logout(sessionId: string) {
     if (!sessionId) throw new BadRequestException('sessionId required');
@@ -266,13 +244,12 @@ export class AuthService {
 
   // ---------------------------
   // sendOtp
-  //  - generate OTP, store hashed, and return raw for dev/testing (in prod, send via provider)
   // ---------------------------
   async sendOtp(tenantId: string, subject: string, purpose = 'login', ttlSeconds = 300) {
     if (!tenantId) throw new BadRequestException('tenantId required');
     if (!subject) throw new BadRequestException('subject required');
 
-    const code = (Math.floor(100000 + Math.random() * 900000)).toString(); // 6-digit numeric
+    const code = (Math.floor(100000 + Math.random() * 900000)).toString();
     const codeHash = HashUtil.hmacOtp(code, AUTH.OTP_HASH_SECRET);
     const expiresAt = new Date(Date.now() + ttlSeconds * 1000);
 
@@ -284,11 +261,13 @@ export class AuthService {
       expires_at: expiresAt,
       attempts: 0,
       max_attempts: 5,
+      consumed_at: null,
+      created_at: new Date(),
     });
 
     await this.otpRepo.save(otpRow);
 
-    // TODO: integrate with SMS/Email provider (SendGrid/Twilio). For now return code (remove in prod).
+    // In development return raw for testing. In production send via SMS/Email and do not return code.
     return { rawCode: code, expiresAt: expiresAt.toISOString() };
   }
 
@@ -301,7 +280,13 @@ export class AuthService {
     }
 
     const otp = await this.otpRepo.findOne({
-      where: { tenant_id: tenantId, subject, purpose, consumed_at: null, expires_at: MoreThan(new Date()) },
+      where: {
+        tenant_id: tenantId,
+        subject,
+        purpose,
+        consumed_at: IsNull(),
+        expires_at: MoreThan(new Date()),
+      },
       order: { created_at: 'DESC' },
     });
 
@@ -323,27 +308,23 @@ export class AuthService {
 
   // ---------------------------
   // resolveRolesAndPermissions
-  //  - Given a user_tenant_id, find roles assigned and aggregate permissions
   // ---------------------------
   private async resolveRolesAndPermissions(userTenantId: string) {
-    // fetch userRoles rows for this userTenant
     const userRoles = await this.userRoleRepo.find({ where: { user_tenant_id: userTenantId } });
     if (!userRoles || userRoles.length === 0) return { roleNames: [], permissionKeys: [] };
 
     const roleIds = userRoles.map((ur) => ur.role_id);
 
-    // fetch role names
-    const roles = await this.roleRepo.findByIds(roleIds);
+    // fetch role entities
+    const roles = await this.roleRepo.find({ where: { id: In(roleIds) } });
     const roleNames = roles.map((r) => r.name);
 
-    // fetch role-permission mapping
-    const rolePerms = await this.rolePermRepo.find({ where: { role_id: roleIds } });
+    // fetch role-permissions using In()
+    const rolePerms = await this.rolePermRepo.find({ where: { role_id: In(roleIds) } });
     const permissionIds = Array.from(new Set(rolePerms.map((rp) => rp.permission_id)));
-
     if (permissionIds.length === 0) return { roleNames, permissionKeys: [] };
 
-    // fetch permission keys
-    const perms = await this.permissionRepo.findByIds(permissionIds);
+    const perms = await this.permissionRepo.find({ where: { id: In(permissionIds) } });
     const permissionKeys = perms.map((p) => p.key);
 
     return { roleNames, permissionKeys };
@@ -351,9 +332,8 @@ export class AuthService {
 }
 
 /* ---------------------------
-   Helper utilities (private to file)
-   - parseDurationDaysToDays
-----------------------------*/
+   helpers
+---------------------------*/
 function parseDurationDaysToDays(str: string) {
   if (!str) return 30;
   const s = str.trim().toLowerCase();
@@ -365,7 +345,6 @@ function parseDurationDaysToDays(str: string) {
     const sec = parseInt(s.slice(0, -1), 10);
     return Number.isNaN(sec) ? 30 : Math.ceil(sec / 86400);
   }
-  // default numeric days or fallback
   const n = parseInt(s, 10);
   return Number.isNaN(n) ? 30 : n;
 }
