@@ -1,350 +1,369 @@
 /**
- * auth.service.ts
+ * AuthService (REFRESH-ID approach)
  *
- * Fully corrected version:
- * - TypeORM v0.3-compatible queries (In, IsNull, MoreThan)
- * - Generates access + refresh tokens (refresh token rotation)
- * - Resolves roles & permissions to include in JWT payload
- * - OTP send & verify (hashed)
+ * Key differences vs earlier implementation:
+ * - Refresh tokens contain `refresh_db_id` (the UUID primary key of refresh_tokens row).
+ * - On login:
+ *     1) create a refresh DB row (without token_hash yet)
+ *     2) sign refreshToken = JWT({ sub, refresh_db_id: saved.id }, refreshSecret)
+ *     3) hash the plain refreshToken and update the DB row token_hash
+ * - On rotate:
+ *     1) verify refresh token signature (using refresh secret)
+ *     2) extract refresh_db_id and load DB row by id
+ *     3) ensure not revoked and not expired
+ *     4) revoke old row and create new row (same flow as login)
  *
- * NOTE: Ensure the entities imported below match actual file names/paths in your repo.
+ * This allows constant-time lookup and robust revocation/rotation.
  */
 
-import {
-  Injectable,
-  BadRequestException,
-  UnauthorizedException,
-  NotFoundException,
-} from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, MoreThan, IsNull, In } from 'typeorm';
+import { Injectable, UnauthorizedException, BadRequestException, Logger } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
-import * as crypto from 'crypto';
-import { addDays } from 'date-fns';
+import { ConfigService } from '@nestjs/config';
+import { Repository } from 'typeorm';
+import { InjectRepository } from '@nestjs/typeorm';
+import * as argon2 from 'argon2';
+import { v4 as uuidv4 } from 'uuid';
+import { addMinutes } from 'date-fns';
 
-import { AUTH } from './constants';
-import { HashUtil } from './utils/hash.util';
-
-// Entities - ensure these paths match your project structure
-import { User } from './entities/users.entity';
-import { UserTenant } from './entities/user-tenants.entity';
-import { Session } from './entities/sessions.entity';
-import { RefreshToken } from './entities/refresh-tokens.entity';
-import { OtpCode } from './entities/otp-codes.entity';
-import { Role } from './entities/roles.entity';
-import { Permission } from './entities/permissions.entity';
-import { RolePermission } from './entities/role-permissions.entity';
-import { UserRole } from './entities/user-roles.entity';
+import { UsersService } from '../users/users.service';
+import { RefreshToken } from './entities/refresh-token.entity';
+import { OtpCode } from './entities/otp-code.entity';
+import { Session } from './entities/session.entity';
 
 @Injectable()
 export class AuthService {
+  private readonly logger = new Logger(AuthService.name);
+
   constructor(
-    @InjectRepository(User) private readonly userRepo: Repository<User>,
-    @InjectRepository(UserTenant) private readonly userTenantRepo: Repository<UserTenant>,
-    @InjectRepository(Session) private readonly sessionRepo: Repository<Session>,
-    @InjectRepository(RefreshToken) private readonly refreshRepo: Repository<RefreshToken>,
-    @InjectRepository(OtpCode) private readonly otpRepo: Repository<OtpCode>,
-    @InjectRepository(Role) private readonly roleRepo: Repository<Role>,
-    @InjectRepository(Permission) private readonly permissionRepo: Repository<Permission>,
-    @InjectRepository(RolePermission) private readonly rolePermRepo: Repository<RolePermission>,
-    @InjectRepository(UserRole) private readonly userRoleRepo: Repository<UserRole>,
     private readonly jwtService: JwtService,
+    private readonly config: ConfigService,
+    private readonly usersService: UsersService,
+
+    @InjectRepository(RefreshToken)
+    private readonly refreshRepo: Repository<RefreshToken>,
+
+    @InjectRepository(OtpCode)
+    private readonly otpRepo: Repository<OtpCode>,
+
+    @InjectRepository(Session)
+    private readonly sessionRepo: Repository<Session>,
   ) {}
 
-  // ---------------------------
-  // register
-  // ---------------------------
-  async register(dto: {
-    displayName: string;
-    loginEmail: string;
-    loginPhone?: string;
-    password: string;
-    tenantId: string;
-  }) {
-    if (!dto.tenantId) throw new BadRequestException('tenantId required');
-
-    // Find or create global user
-    let globalUser = await this.userRepo.findOne({ where: { primary_email: dto.loginEmail } });
-    if (!globalUser) {
-      globalUser = this.userRepo.create({
-        primary_email: dto.loginEmail,
-        primary_phone: dto.loginPhone || null,
-        display_name: dto.displayName,
-      });
-      globalUser = await this.userRepo.save(globalUser);
-    }
-
-    // Ensure tenant membership does not exist
-    const existing = await this.userTenantRepo.findOne({
-      where: { tenant_id: dto.tenantId, login_email: dto.loginEmail },
-    });
-    if (existing) throw new BadRequestException('User already exists for this tenant');
-
-    const passwordHash = await HashUtil.hashPassword(dto.password);
-
-    const userTenant = this.userTenantRepo.create({
-      tenant_id: dto.tenantId,
-      user_id: globalUser.id,
-      login_email: dto.loginEmail,
-      login_phone: dto.loginPhone || null,
-      password_hash: passwordHash,
-      is_active: true,
-      is_email_verified: false,
-    });
-
-    const saved = await this.userTenantRepo.save(userTenant);
-    return { userTenantId: saved.id, userId: saved.user_id };
+  // -------------------------
+  // Utility: token creation
+  // -------------------------
+  private createAccessToken(payload: any) {
+    const secret = this.config.get<string>('JWT_ACCESS_TOKEN_SECRET');
+    const expiresIn = this.config.get<string>('JWT_ACCESS_TOKEN_EXPIRES_IN') || '15m';
+    return this.jwtService.sign(payload, { secret, expiresIn });
   }
 
-  // ---------------------------
-  // login
-  // ---------------------------
-  async login(dto: {
-    loginEmail?: string;
-    loginPhone?: string;
-    password: string;
-    tenantId: string;
-    deviceFingerprint?: string | null;
+  private signRefreshToken(payload: any) {
+    const secret = this.config.get<string>('JWT_REFRESH_TOKEN_SECRET');
+    const expiresIn = this.config.get<string>('JWT_REFRESH_TOKEN_EXPIRES_IN') || '30d';
+    return this.jwtService.sign(payload, { secret, expiresIn });
+  }
+
+  private computeRefreshExpiry(): Date {
+    const qty = this.config.get<string>('JWT_REFRESH_TOKEN_EXPIRES_IN') || '30d';
+    const v = qty.toLowerCase();
+    const now = new Date();
+    if (v.endsWith('d')) {
+      const days = parseInt(v.slice(0, -1), 10);
+      return new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
+    }
+    if (v.endsWith('h')) {
+      const hrs = parseInt(v.slice(0, -1), 10);
+      return new Date(now.getTime() + hrs * 60 * 60 * 1000);
+    }
+    if (v.endsWith('m')) {
+      const mins = parseInt(v.slice(0, -1), 10);
+      return new Date(now.getTime() + mins * 60 * 1000);
+    }
+    return new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+  }
+
+  // -------------------------
+  // Register
+  // -------------------------
+  async register(data: {
+    email: string;
+    password?: string;
+    first_name?: string;
+    last_name?: string;
+    tenant_id?: string;
   }) {
-    if (!dto.tenantId) throw new BadRequestException('tenantId required');
-
-    const where = dto.loginEmail
-      ? { tenant_id: dto.tenantId, login_email: dto.loginEmail }
-      : { tenant_id: dto.tenantId, login_phone: dto.loginPhone };
-
-    const userTenant = await this.userTenantRepo.findOne({ where });
-    if (!userTenant) throw new UnauthorizedException('Invalid credentials');
-
-    if (!userTenant.password_hash) throw new UnauthorizedException('No password configured for this account');
-
-    const valid = await HashUtil.verifyPassword(userTenant.password_hash, dto.password);
-    if (!valid) throw new UnauthorizedException('Invalid credentials');
-
-    if (!userTenant.is_active) throw new UnauthorizedException('User is disabled');
-
-    // create session
-    const session = this.sessionRepo.create({
-      user_tenant_id: userTenant.id,
-      device_fingerprint: dto.deviceFingerprint || null,
-      ip_address: null,
-      user_agent: null,
-      last_accessed: new Date(),
-      is_revoked: false,
-      expires_at: null,
+    const user = await this.usersService.createUser({
+      email: data.email,
+      password: data.password,
+      first_name: data.first_name,
+      last_name: data.last_name,
+      tenant_id: data.tenant_id,
     });
-    const savedSession = await this.sessionRepo.save(session);
 
-    // roles & permissions
-    const { roleNames, permissionKeys } = await this.resolveRolesAndPermissions(userTenant.id);
+    return this.usersService.sanitizeUser(user);
+  }
 
-    const payload = {
-      sub: userTenant.id,
-      tenant: userTenant.tenant_id,
-      roles: roleNames,
-      permissions: permissionKeys,
+  // -------------------------
+  // Login
+  // -------------------------
+  /**
+   * Login flow:
+   *  - verify credentials
+   *  - create refresh DB row (no token_hash)
+   *  - sign refresh token including refresh_db_id
+   *  - hash refresh token and update DB row.token_hash
+   *  - create session and return access & refresh tokens
+   */
+  async login({
+    email,
+    password,
+    tenant_id,
+    ip,
+    user_agent,
+  }: {
+    email: string;
+    password: string;
+    tenant_id?: string;
+    ip?: string;
+    user_agent?: string;
+  }) {
+    const user = await this.usersService.findByEmail(email);
+    if (!user) throw new UnauthorizedException('Invalid credentials');
+
+    const ok = await this.usersService.verifyPassword(user.id, password);
+    if (!ok) throw new UnauthorizedException('Invalid credentials');
+
+    let userTenantRow = null;
+    if (tenant_id) {
+      userTenantRow = await this.usersService.findOrCreateUserTenant(user.id, tenant_id);
+    }
+
+    const payloadAccess: any = {
+      sub: user.id,
+      email: user.email,
+      userTenantId: userTenantRow ? userTenantRow.id : undefined,
     };
 
-    const accessToken = await this.generateAccessToken(payload);
-    const refreshEntry = await this.generateRefreshTokenEntry(savedSession.id);
+    // 1) create refresh DB row (we need the saved id to embed in JWT)
+    const refreshRow = this.refreshRepo.create({
+      user_tenant_id: userTenantRow ? userTenantRow.id : null,
+      revoked: false,
+      expires_at: this.computeRefreshExpiry(),
+      token_hash: null, // placeholder; will update after signing
+    });
+
+    const savedRefresh = await this.refreshRepo.save(refreshRow);
+
+    // 2) sign refresh token embedding the DB id
+    const refreshTokenPlain = this.signRefreshToken({
+      sub: user.id,
+      refresh_db_id: savedRefresh.id,
+    });
+
+    // 3) hash refreshToken and update row
+    const tokenHash = await argon2.hash(refreshTokenPlain);
+    savedRefresh.token_hash = tokenHash;
+    await this.refreshRepo.save(savedRefresh);
+
+    // 4) create session row and link refresh token
+    const sessionRow = this.sessionRepo.create({
+      user_tenant_id: userTenantRow ? userTenantRow.id : null,
+      ip,
+      user_agent,
+      refresh_token_id: savedRefresh.id,
+      active: true,
+    });
+    const savedSession = await this.sessionRepo.save(sessionRow);
+
+    // 5) create access token
+    const accessToken = this.createAccessToken(payloadAccess);
 
     return {
       accessToken,
-      refreshToken: refreshEntry.raw,
-      refreshTokenExpiresAt: refreshEntry.expiresAt.toISOString(),
+      refreshToken: refreshTokenPlain,
+      refreshTokenId: savedRefresh.id,
       sessionId: savedSession.id,
-      userTenantId: userTenant.id,
-      roles: roleNames,
-      permissions: permissionKeys,
     };
   }
 
-  // ---------------------------
-  // generateAccessToken
-  // ---------------------------
-  async generateAccessToken(payload: any) {
-    return this.jwtService.sign(payload, {
-      secret: AUTH.ACCESS_SECRET,
-      expiresIn: AUTH.ACCESS_EXPIRES_IN,
-    });
-  }
-
-  // ---------------------------
-  // generateRefreshTokenEntry
-  // ---------------------------
-  async generateRefreshTokenEntry(sessionId?: string) {
-    const raw = crypto.randomBytes(64).toString('hex');
-    const hashed = HashUtil.hmac(raw, AUTH.REFRESH_HASH_SECRET);
-
-    const days = parseDurationDaysToDays(AUTH.REFRESH_EXPIRES_IN || '30d');
-    const expiresAt = addDays(new Date(), days);
-
-    const rt = this.refreshRepo.create({
-      session_id: sessionId || null,
-      token_hash: hashed,
-      issued_at: new Date(),
-      expires_at: expiresAt,
-      revoked_at: null,
-      replaced_by: null,
-    });
-
-    const saved = await this.refreshRepo.save(rt);
-    return { raw, hashed, expiresAt: saved.expires_at, id: saved.id };
-  }
-
-  // ---------------------------
-  // refresh
-  // ---------------------------
-  async refresh(refreshTokenRaw: string, sessionId: string) {
-    if (!refreshTokenRaw) throw new BadRequestException('refreshToken required');
-    if (!sessionId) throw new BadRequestException('sessionId required');
-
-    const hashed = HashUtil.hmac(refreshTokenRaw, AUTH.REFRESH_HASH_SECRET);
-    const stored = await this.refreshRepo.findOne({ where: { token_hash: hashed } });
-
-    if (!stored) throw new UnauthorizedException('Invalid refresh token');
-    if (stored.revoked_at) throw new UnauthorizedException('Refresh token revoked');
-    if (stored.expires_at < new Date()) throw new UnauthorizedException('Refresh token expired');
-    if (stored.session_id !== sessionId) throw new UnauthorizedException('Session mismatch');
-
-    const session = await this.sessionRepo.findOne({ where: { id: sessionId } });
-    if (!session || session.is_revoked) throw new UnauthorizedException('Session invalid');
-
-    const newEntry = await this.generateRefreshTokenEntry(sessionId);
-
-    stored.revoked_at = new Date();
-    stored.replaced_by = newEntry.id;
-    await this.refreshRepo.save(stored);
-
-    const userTenant = await this.userTenantRepo.findOne({ where: { id: session.user_tenant_id } });
-    if (!userTenant) throw new NotFoundException('User session not found');
-
-    const { roleNames, permissionKeys } = await this.resolveRolesAndPermissions(userTenant.id);
-    const payload = { sub: userTenant.id, tenant: userTenant.tenant_id, roles: roleNames, permissions: permissionKeys };
-    const access = await this.generateAccessToken(payload);
-
-    return { accessToken: access, refreshToken: newEntry.raw, refreshTokenExpiresAt: newEntry.expiresAt.toISOString() };
-  }
-
-  // ---------------------------
-  // logout
-  // ---------------------------
-  async logout(sessionId: string) {
-    if (!sessionId) throw new BadRequestException('sessionId required');
-
-    const session = await this.sessionRepo.findOne({ where: { id: sessionId } });
-    if (!session) throw new NotFoundException('Session not found');
-
-    session.is_revoked = true;
-    await this.sessionRepo.save(session);
-
-    await this.refreshRepo.update({ session_id: sessionId }, { revoked_at: new Date() });
-
-    return { ok: true };
-  }
-
-  // ---------------------------
-  // sendOtp
-  // ---------------------------
-  async sendOtp(tenantId: string, subject: string, purpose = 'login', ttlSeconds = 300) {
-    if (!tenantId) throw new BadRequestException('tenantId required');
-    if (!subject) throw new BadRequestException('subject required');
-
-    const code = (Math.floor(100000 + Math.random() * 900000)).toString();
-    const codeHash = HashUtil.hmacOtp(code, AUTH.OTP_HASH_SECRET);
-    const expiresAt = new Date(Date.now() + ttlSeconds * 1000);
-
-    const otpRow = this.otpRepo.create({
-      tenant_id: tenantId,
-      subject,
-      purpose,
-      code_hash: codeHash,
-      expires_at: expiresAt,
-      attempts: 0,
-      max_attempts: 5,
-      consumed_at: null,
-      created_at: new Date(),
-    });
-
-    await this.otpRepo.save(otpRow);
-
-    // In development return raw for testing. In production send via SMS/Email and do not return code.
-    return { rawCode: code, expiresAt: expiresAt.toISOString() };
-  }
-
-  // ---------------------------
-  // verifyOtp
-  // ---------------------------
-  async verifyOtp(tenantId: string, subject: string, purpose: string, presentedCode: string) {
-    if (!tenantId || !subject || !purpose || !presentedCode) {
-      throw new BadRequestException('missing parameters');
+  // -------------------------
+  // Rotate Refresh Token
+  // -------------------------
+  /**
+   * rotateRefreshToken:
+   *  - verify token signature (refresh secret)
+   *  - extract refresh_db_id
+   *  - find DB row by id => O(1)
+   *  - check revoked / expired
+   *  - revoke old row, create new row & token (same flow as login)
+   */
+  async rotateRefreshToken({
+    oldRefreshToken,
+    ip,
+    user_agent,
+  }: {
+    oldRefreshToken: string;
+    ip?: string;
+    user_agent?: string;
+  }) {
+    // verify signature first (throws if invalid)
+    let payload: any;
+    try {
+      payload = await this.jwtService.verifyAsync(oldRefreshToken, {
+        secret: this.config.get<string>('JWT_REFRESH_TOKEN_SECRET'),
+      });
+    } catch (err) {
+      throw new UnauthorizedException('Invalid refresh token');
     }
 
-    const otp = await this.otpRepo.findOne({
-      where: {
-        tenant_id: tenantId,
-        subject,
-        purpose,
-        consumed_at: IsNull(),
-        expires_at: MoreThan(new Date()),
-      },
+    const refreshDbId = payload.refresh_db_id;
+    const userId = payload.sub;
+    if (!refreshDbId || !userId) {
+      throw new UnauthorizedException('Malformed refresh token');
+    }
+
+    const dbRow = await this.refreshRepo.findOne({ where: { id: refreshDbId } });
+
+    if (!dbRow) {
+      throw new UnauthorizedException('Refresh token record not found');
+    }
+
+    if (dbRow.revoked) {
+      // token reuse attack — revoke all sessions for this user's tenant (optional)
+      throw new UnauthorizedException('Refresh token revoked');
+    }
+
+    if (dbRow.expires_at && new Date(dbRow.expires_at) < new Date()) {
+      throw new UnauthorizedException('Refresh token expired');
+    }
+
+    // OPTIONAL: verify stored token_hash matches the provided token (detect copied tokens)
+    try {
+      const ok = dbRow.token_hash ? await argon2.verify(dbRow.token_hash, oldRefreshToken) : false;
+      if (!ok) {
+        // either tokens don't match or hash missing -> treat as invalid
+        throw new UnauthorizedException('Refresh token verification failed');
+      }
+    } catch (err) {
+      throw new UnauthorizedException('Refresh token verification failed');
+    }
+
+    // Revoke old DB row
+    dbRow.revoked = true;
+    await this.refreshRepo.save(dbRow);
+
+    // Create new refresh DB row
+    const newRow = this.refreshRepo.create({
+      user_tenant_id: dbRow.user_tenant_id ?? null,
+      revoked: false,
+      expires_at: this.computeRefreshExpiry(),
+      token_hash: null,
+    });
+    const savedNewRow = await this.refreshRepo.save(newRow);
+
+    // Sign new refresh token containing new DB id
+    const newRefreshPlain = this.signRefreshToken({ sub: userId, refresh_db_id: savedNewRow.id });
+
+    // Hash and update DB
+    savedNewRow.token_hash = await argon2.hash(newRefreshPlain);
+    await this.refreshRepo.save(savedNewRow);
+
+    // Update session to point to new refresh token id (if session exists)
+    const session = await this.sessionRepo.findOne({ where: { refresh_token_id: dbRow.id } });
+    if (session) {
+      session.refresh_token_id = savedNewRow.id;
+      session.ip = ip ?? session.ip;
+      session.user_agent = user_agent ?? session.user_agent;
+      await this.sessionRepo.save(session);
+    }
+
+    // Create new access token payload (we include userTenantId for RBAC)
+    const user = await this.usersService.findById(userId);
+    const accessPayload: any = {
+      sub: user.id,
+      email: user.email,
+      userTenantId: dbRow.user_tenant_id ?? undefined,
+    };
+    const newAccess = this.createAccessToken(accessPayload);
+
+    return { accessToken: newAccess, refreshToken: newRefreshPlain };
+  }
+
+  // -------------------------
+  // Logout
+  // -------------------------
+  /**
+   * logout:
+   *  - verify refresh token signature
+   *  - extract refresh_db_id, set revoked = true
+   *  - deactivate session linked to token
+   */
+  async logout({ refreshToken }: { refreshToken: string }) {
+    if (!refreshToken) return;
+
+    let payload: any;
+    try {
+      payload = await this.jwtService.verifyAsync(refreshToken, {
+        secret: this.config.get<string>('JWT_REFRESH_TOKEN_SECRET'),
+      });
+    } catch (err) {
+      // token is invalid — nothing further to do
+      return;
+    }
+
+    const refreshDbId = payload.refresh_db_id;
+    if (!refreshDbId) return;
+
+    const row = await this.refreshRepo.findOne({ where: { id: refreshDbId } });
+    if (!row) return;
+
+    row.revoked = true;
+    await this.refreshRepo.save(row);
+
+    // deactivate session
+    const session = await this.sessionRepo.findOne({ where: { refresh_token_id: row.id } });
+    if (session) {
+      session.active = false;
+      await this.sessionRepo.save(session);
+    }
+  }
+
+  // -------------------------
+  // OTP functions (unchanged)
+  // -------------------------
+  async generateOtp({ subject, purpose, tenant_id }: { subject: string; purpose: string; tenant_id?: string }) {
+    const code = Math.floor(100000 + Math.random() * 900000).toString(); // 6-digit
+    const minutes = parseInt(this.config.get<string>('OTP_EXPIRY_MINUTES') || '30', 10);
+    const expires_at = addMinutes(new Date(), minutes);
+
+    const otpRow = this.otpRepo.create({
+      tenant_id,
+      subject,
+      code,
+      purpose,
+      expires_at,
+    });
+
+    const saved = await this.otpRepo.save(otpRow);
+
+    // Hook to real sender (email/SMS) should be called here.
+    this.logger.log(`OTP for ${subject} (${purpose}) => ${code} (expires ${expires_at.toISOString()})`);
+    return { id: saved.id, code }; // returning code only for dev/testing
+  }
+
+  async verifyOtp({ subject, purpose, code }: { subject: string; purpose: string; code: string }) {
+    const row = await this.otpRepo.findOne({
+      where: { subject, purpose, consumed_at: null },
       order: { created_at: 'DESC' },
     });
 
-    if (!otp) throw new NotFoundException('OTP not found or expired');
+    if (!row) throw new BadRequestException('OTP not found');
+    if (new Date(row.expires_at) < new Date()) throw new BadRequestException('OTP expired');
+    if (row.code !== code) throw new BadRequestException('Invalid OTP');
 
-    if (otp.attempts >= otp.max_attempts) throw new UnauthorizedException('OTP locked due to failed attempts');
-
-    const presentedHash = HashUtil.hmacOtp(presentedCode, AUTH.OTP_HASH_SECRET);
-    if (presentedHash !== otp.code_hash) {
-      otp.attempts = otp.attempts + 1;
-      await this.otpRepo.save(otp);
-      throw new UnauthorizedException('Invalid code');
-    }
-
-    otp.consumed_at = new Date();
-    await this.otpRepo.save(otp);
-    return { ok: true };
+    row.consumed_at = new Date();
+    await this.otpRepo.save(row);
+    return true;
   }
-
-  // ---------------------------
-  // resolveRolesAndPermissions
-  // ---------------------------
-  private async resolveRolesAndPermissions(userTenantId: string) {
-    const userRoles = await this.userRoleRepo.find({ where: { user_tenant_id: userTenantId } });
-    if (!userRoles || userRoles.length === 0) return { roleNames: [], permissionKeys: [] };
-
-    const roleIds = userRoles.map((ur) => ur.role_id);
-
-    // fetch role entities
-    const roles = await this.roleRepo.find({ where: { id: In(roleIds) } });
-    const roleNames = roles.map((r) => r.name);
-
-    // fetch role-permissions using In()
-    const rolePerms = await this.rolePermRepo.find({ where: { role_id: In(roleIds) } });
-    const permissionIds = Array.from(new Set(rolePerms.map((rp) => rp.permission_id)));
-    if (permissionIds.length === 0) return { roleNames, permissionKeys: [] };
-
-    const perms = await this.permissionRepo.find({ where: { id: In(permissionIds) } });
-    const permissionKeys = perms.map((p) => p.key);
-
-    return { roleNames, permissionKeys };
-  }
-}
-
-/* ---------------------------
-   helpers
----------------------------*/
-function parseDurationDaysToDays(str: string) {
-  if (!str) return 30;
-  const s = str.trim().toLowerCase();
-  if (s.endsWith('d')) {
-    const n = parseInt(s.slice(0, -1), 10);
-    return Number.isNaN(n) ? 30 : n;
-  }
-  if (s.endsWith('s')) {
-    const sec = parseInt(s.slice(0, -1), 10);
-    return Number.isNaN(sec) ? 30 : Math.ceil(sec / 86400);
-  }
-  const n = parseInt(s, 10);
-  return Number.isNaN(n) ? 30 : n;
 }

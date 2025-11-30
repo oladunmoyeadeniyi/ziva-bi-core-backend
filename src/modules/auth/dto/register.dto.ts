@@ -1,30 +1,23 @@
-// register.dto.ts
-import { IsEmail, IsNotEmpty, IsOptional, IsString } from 'class-validator';
+import { IsEmail, IsOptional, IsString, MinLength } from 'class-validator';
 
-/**
- * DTO: register a user (tenant-scoped)
- * - tenant signup / admin created user flows will use this
- */
 export class RegisterDto {
-  @IsNotEmpty()
-  @IsString()
-  displayName!: string;
-
   @IsEmail()
-  loginEmail!: string;
+  email: string;
+
+  @IsString()
+  @MinLength(6)
+  password: string;
 
   @IsOptional()
   @IsString()
-  loginPhone?: string;
+  first_name?: string;
 
-  @IsNotEmpty()
+  @IsOptional()
   @IsString()
-  password!: string;
+  last_name?: string;
 
-  /**
-   * tenantId expected for tenant-scoped creation.
-   * For self-signup flows tenant_creation is separate and out of scope here.
-   */
+  // tenant where user will be created (optional)
+  @IsOptional()
   @IsString()
-  tenantId!: string;
+  tenant_id?: string;
 }

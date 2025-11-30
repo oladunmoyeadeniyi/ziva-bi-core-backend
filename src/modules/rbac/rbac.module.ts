@@ -1,3 +1,13 @@
+/**
+ * RbacModule
+ *
+ * Provides:
+ *  - RbacService
+ *  - RbacController
+ *  - RbacGuard (exported for global usage)
+ *  - Decorator for permissions
+ */
+
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 
@@ -7,27 +17,15 @@ import { RolePermission } from './entities/role-permission.entity';
 import { UserRole } from './entities/user-role.entity';
 
 import { RbacService } from './rbac.service';
-
-import { PermissionsGuard } from './permissions.guard';
-import { RolesGuard } from './roles.guard';
-
 import { RbacController } from './rbac.controller';
-import { AuditModule } from '../audit/audit.module';
-
-/**
- * RBAC MODULE
- * -------------------------
- * Registers entities, controller, guards and the RBAC service.
- * Now imports AuditModule so RBAC actions are logged.
- */
+import { RbacGuard } from './rbac.guard';
 
 @Module({
   imports: [
     TypeOrmModule.forFeature([Role, Permission, RolePermission, UserRole]),
-    AuditModule,
   ],
   controllers: [RbacController],
-  providers: [RbacService, PermissionsGuard, RolesGuard],
-  exports: [RbacService, PermissionsGuard, RolesGuard],
+  providers: [RbacService, RbacGuard],
+  exports: [RbacService, RbacGuard],
 })
 export class RbacModule {}

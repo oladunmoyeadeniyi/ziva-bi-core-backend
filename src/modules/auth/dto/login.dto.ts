@@ -1,27 +1,22 @@
-// login.dto.ts
-import { IsNotEmpty, IsOptional, IsString } from 'class-validator';
+import { IsEmail, IsOptional, IsString } from 'class-validator';
 
 export class LoginDto {
-  // Accept email OR phone as login identifier
+  @IsEmail()
+  email: string;
+
+  @IsString()
+  password: string;
+
+  // optional fields for client context tracking
   @IsOptional()
   @IsString()
-  loginEmail?: string;
+  tenant_id?: string;
 
   @IsOptional()
   @IsString()
-  loginPhone?: string;
+  ip?: string;
 
-  @IsNotEmpty()
-  @IsString()
-  password!: string;
-
-  // tenant context is required to locate tenant-scoped user
-  @IsNotEmpty()
-  @IsString()
-  tenantId!: string;
-
-  // Optional device fingerprint for trusted devices
   @IsOptional()
   @IsString()
-  deviceFingerprint?: string;
+  user_agent?: string;
 }

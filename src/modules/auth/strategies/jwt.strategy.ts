@@ -1,53 +1,35 @@
-// jwt.strategy.ts
 import { Injectable } from '@nestjs/common';
 import { PassportStrategy } from '@nestjs/passport';
 import { Strategy, ExtractJwt } from 'passport-jwt';
-import { AUTH } from '../constants';
-import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
-import { UserTenant } from '../entities/user-tenants.entity';
-
-/**
- * JWT Strategy:
- * - Validates JWT access tokens
- * - Loads tenant-scoped user membership (user_tenants)
- *
- * Note: The JWT payload should include: { sub: user_tenant_id, tenant: tenant_id, roles: [...], permissions: [...] }
- */
+import { ConfigService } from '@nestjs/config';
+import { UsersService } from '../../users/users.service';
 
 @Injectable()
 export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
-  constructor(
-    @InjectRepository(UserTenant)
-    private readonly userTenantRepo: Repository<UserTenant>,
-  ) {
+  constructor(private readonly config: ConfigService, private readonly usersService: UsersService) {
     super({
       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
       ignoreExpiration: false,
-      secretOrKey: AUTH.ACCESS_SECRET,
+      secretOrKey: config.get<string>('JWT_ACCESS_TOKEN_SECRET'),
     });
   }
 
-  // When JWT is valid, this method returns the "user" attached to request
+  /**
+   * Validate is called after the token is verified.
+   * We fetch user basic profile to attach to req.user for controllers.
+   */
   async validate(payload: any) {
-    // payload.sub is expected to be user_tenant_id (tenant-scoped membership)
-    const userTenant = await this.userTenantRepo.findOne({
-      where: { id: payload.sub },
-    });
-
-    if (!userTenant || !userTenant.is_active) {
-      return null; // authentication fails if user not found or inactive
-    }
-
-    // return minimal user object to attach on req.user
+    // payload.sub === userId
+    const user = await this.usersService.findById(payload.sub);
+    if (!user) return null;
+    // We may return sanitized user + tenant context (userTenantId)
     return {
-      userTenantId: userTenant.id,
-      userId: userTenant.user_id,
-      tenantId: userTenant.tenant_id,
-      email: userTenant.login_email,
-      phone: userTenant.login_phone,
-      roles: payload.roles || [],
-      permissions: payload.permissions || [],
+      id: user.id,
+      email: user.email,
+      first_name: user.first_name,
+      last_name: user.last_name,
+      userTenantId: payload.userTenantId ?? null,
+      roles: user.roles ?? [],
     };
   }
 }

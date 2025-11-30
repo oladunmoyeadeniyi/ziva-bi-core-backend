@@ -1,12 +1,14 @@
-// refresh.dto.ts
-import { IsNotEmpty, IsString } from 'class-validator';
+import { IsString, IsOptional } from 'class-validator';
 
 export class RefreshDto {
-  @IsNotEmpty()
   @IsString()
-  refreshToken!: string;
+  refreshToken: string;
 
-  @IsNotEmpty()
+  @IsOptional()
   @IsString()
-  sessionId!: string;
+  ip?: string;
+
+  @IsOptional()
+  @IsString()
+  user_agent?: string;
 }

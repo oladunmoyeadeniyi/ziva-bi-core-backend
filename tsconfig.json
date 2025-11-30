@@ -1,17 +1,30 @@
 {
   "compilerOptions": {
-    "module": "commonjs",
-    "declaration": true,
-    "removeComments": true,
-    "emitDecoratorMetadata": true,
-    "experimentalDecorators": true,
-    "target": "es2018",
-    "sourceMap": true,
+    /* ===== Output ===== */
     "outDir": "./dist",
-    "strict": true,
-    "skipLibCheck": true,
-    "esModuleInterop": true
+    "rootDir": "./src",
+    "sourceMap": false,
+
+    /* ===== Module System ===== */
+    "module": "commonjs",
+    "target": "es2020",
+    "moduleResolution": "node",
+    "resolveJsonModule": true,
+
+    /* ===== NestJS + TypeORM Required Flags ===== */
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+    "strictPropertyInitialization": false,
+    "strictNullChecks": false,
+
+    /* ===== Code Quality ===== */
+    "noImplicitAny": false,
+    "removeComments": true,
+
+    /* ===== Interoperability ===== */
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true
   },
-  "include": ["src/**/*"],
+  "include": ["src/**/*.ts"],
   "exclude": ["node_modules", "dist"]
 }
